@@ -1,0 +1,5 @@
+torch>=2.3.1
+transformers==5.2.0
+kvpress==0.5.5
+# kvpress pins fire<0.7, which imports the `pipes` module removed in Python 3.13.
+standard-pipes; python_version >= "3.13"

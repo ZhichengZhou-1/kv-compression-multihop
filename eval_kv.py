@@ -9,16 +9,32 @@ Conditions:
     nocontext    questions asked with an empty document (checks answers need the context)
     rand<r>      kvpress RandomPress, evicting a fraction r of document KV entries (e.g. rand0.5)
     int<b>       per-token round-to-nearest fake quantization of document K/V to b bits (e.g. int4)
+    int<b>k      per-token quantization of K only (V stays fp16); int<b>v quantizes V only
+    kivi<b>      KIVI-style: K quantized per channel in groups of 32 tokens, V per token
+    kivi<b>k     per-channel K only (V stays fp16); kivi<b>v is the same as int<b>v
+
+Restoration (appended to a rand<r>, int*/kivi* condition with '+'):
+    <base>+fact1       keep fact 1's tokens at full fidelity (not evicted / not quantized)
+    <base>+fact2       same for fact 2
+    <base>+both        both facts
+    <base>+after       for each fact, the same number of tokens right after it
+    <base>+<set>_rnd   control: the same number of random document positions, excluding the facts and <set>
+    Restored entries are kept on top of the compression budget. rand<r>+<set> uses a built-in random eviction
+    that mirrors RandomPress and shares its random draw across all restore sets of an item.
 
 Usage:
     python eval_kv.py --data data/two_hop.jsonl --n-per-config 5 --conditions full nocontext
     python eval_kv.py --conditions full nocontext rand0.25 rand0.5 rand0.75 int8 int4 int3 int2
+    python eval_kv.py --conditions int4 int4k int4v kivi4 kivi4k kivi2
+    python eval_kv.py --conditions int4 int4+fact1 int4+fact1_rnd int4+both int4+both_rnd int4+after int4+after_rnd
 """
 
 import argparse
 import collections
 import json
 import os
+import random
+import re
 import time
 
 import torch
@@ -51,15 +67,126 @@ def build_prompt_parts(tokenizer, document):
     return context, question_suffix
 
 
-def quantize_per_token(x, bits):
-    """Asymmetric round-to-nearest quantization with one (scale, min) per token per head, then dequantize."""
+KIVI_GROUP_SIZE = 32  # tokens per (scale, min) group for per-channel key quantization
+QUANT_RE = re.compile(r"^(int|kivi)(\d+)([kv]?)$")
+RESTORE_SETS = ("fact1", "fact2", "both", "after")
+
+
+def _fake_quantize(x, bits, dim):
+    """Asymmetric round-to-nearest quantization with one (scale, min) per slice along `dim`, then dequantize."""
     x_float = x.float()
-    x_min = x_float.amin(dim=-1, keepdim=True)
-    x_max = x_float.amax(dim=-1, keepdim=True)
+    x_min = x_float.amin(dim=dim, keepdim=True)
+    x_max = x_float.amax(dim=dim, keepdim=True)
     levels = 2**bits - 1
     scale = (x_max - x_min).clamp(min=1e-8) / levels
     q = ((x_float - x_min) / scale).round().clamp(0, levels)
     return (q * scale + x_min).to(x.dtype)
+
+
+def quantize_per_token(x, bits):
+    """One (scale, min) per token per head, shared across the head dimension."""
+    return _fake_quantize(x, bits, dim=-1)
+
+
+def quantize_per_channel(x, bits, group_size=KIVI_GROUP_SIZE):
+    """KIVI-style: one (scale, min) per channel per head, shared across groups of `group_size` tokens."""
+    return torch.cat([_fake_quantize(x[:, :, s:s + group_size], bits, dim=-2)
+                      for s in range(0, x.shape[-2], group_size)], dim=-2)
+
+
+def parse_quant(cond):
+    """Map a quantization condition to (key_mode, value_mode, bits); modes are 'token', 'channel' or None.
+
+    int<b>   per-token K and V          int<b>k / int<b>v    per-token K only / V only
+    kivi<b>  per-channel K, per-token V  kivi<b>k / kivi<b>v  per-channel K only / per-token V only
+    """
+    m = QUANT_RE.match(cond)
+    if m is None:
+        return None
+    scheme, bits, only = m.group(1), int(m.group(2)), m.group(3)
+    key_mode = "channel" if scheme == "kivi" else "token"
+    return (key_mode if only != "v" else None, "token" if only != "k" else None, bits)
+
+
+def bits_per_value(mode, bits, head_dim):
+    """Storage cost per K or V entry, including an fp16 scale and min per quantization group."""
+    if mode is None:
+        return 16.0
+    return bits + 32 / (head_dim if mode == "token" else KIVI_GROUP_SIZE)
+
+
+def quantize_tensor(x, mode, bits):
+    if mode is None:
+        return x
+    return quantize_per_token(x, bits) if mode == "token" else quantize_per_channel(x, bits)
+
+
+def document_token_spans(tokenizer, context, document, item):
+    """Token indices (into the context ids) of the document and of each supporting fact."""
+    doc_start = context.index(INSTRUCTION + document) + len(INSTRUCTION)
+    enc = tokenizer(context, add_special_tokens=False, return_offsets_mapping=True)
+    offsets = enc["offset_mapping"]
+
+    def tokens_in(start, end):
+        return [i for i, (s, e) in enumerate(offsets) if s < doc_start + end and e > doc_start + start]
+
+    return {
+        "doc": tokens_in(0, len(document)),
+        "fact1": tokens_in(*item["fact1_span"]),
+        "fact2": tokens_in(*item["fact2_span"]),
+    }
+
+
+def restore_positions(spans, target, control, seed):
+    """Context positions to keep at full fidelity.
+
+    fact1 / fact2 / both: the supporting facts' tokens.
+    after: for each fact, the same number of tokens immediately after it (excluding the facts themselves).
+    control: the same number of positions drawn uniformly from the rest of the document, excluding both facts
+             and the target set.
+    """
+    facts = set(spans["fact1"]) | set(spans["fact2"])
+    doc_end = spans["doc"][-1] + 1
+    if target == "fact1":
+        chosen = set(spans["fact1"])
+    elif target == "fact2":
+        chosen = set(spans["fact2"])
+    elif target == "both":
+        chosen = facts
+    elif target == "after":
+        chosen = set()
+        for key in ("fact1", "fact2"):
+            last, size = spans[key][-1], len(spans[key])
+            chosen |= set(range(last + 1, min(last + 1 + size, doc_end)))
+        chosen -= facts
+    else:
+        raise ValueError(f"unknown restore set {target}")
+    if not control:
+        return sorted(chosen)
+    pool = sorted(set(spans["doc"]) - facts - chosen)
+    return sorted(random.Random(seed).sample(pool, len(chosen)))
+
+
+def evict_random(cache, ratio, keep, seed):
+    """Random per-head eviction of a full cache, mirroring kvpress RandomPress (int(n * (1 - ratio)) entries
+    kept per head), except that positions in `keep` are always kept on top of that budget.
+
+    Compressing after a full prefill is equivalent to kvpress's prefill hooks: each layer's prefill attention
+    sees that layer's full cache either way. The generator is seeded per item, so every restore set of an item
+    shares the same random scores and the comparison between restore sets is paired.
+    """
+    n = cache.layers[0].keys.shape[-2]
+    n_kept = int(n * (1 - ratio))
+    keep = torch.tensor(keep, dtype=torch.long)
+    gen = torch.Generator().manual_seed(seed)
+    for layer in cache.layers:
+        n_heads = layer.keys.shape[1]
+        scores = torch.rand(n_heads, n, generator=gen)
+        scores[:, keep] = 2.0  # above every random score, so always kept
+        idx = scores.topk(n_kept + len(keep), dim=-1).indices.sort(dim=-1).values
+        idx = idx.to(layer.keys.device)[None, :, :, None]
+        layer.keys = layer.keys.gather(2, idx.expand(-1, -1, -1, layer.keys.shape[-1]))
+        layer.values = layer.values.gather(2, idx.expand(-1, -1, -1, layer.values.shape[-1]))
 
 
 def cache_lengths(cache):
@@ -136,50 +263,86 @@ def kv_entries(cache):
     return sum(layer.keys.shape[-2] * layer.keys.shape[1] for layer in cache.layers)
 
 
+def parse_condition(cond):
+    """Split '<base>[+<restore set>[_rnd]]' into (base, restore set or None, is_random_control)."""
+    base, _, restore = cond.partition("+")
+    if not restore:
+        return base, None, False
+    control = restore.endswith("_rnd")
+    target = restore[:-len("_rnd")] if control else restore
+    if target not in RESTORE_SETS:
+        raise ValueError(f"unknown restore set in {cond}; expected one of {RESTORE_SETS} (optionally + '_rnd')")
+    if not (base.startswith("rand") or parse_quant(base)):
+        raise ValueError(f"restoration needs a rand<r>, int<b> or kivi<b> base, got {cond}")
+    return base, target, control
+
+
 @torch.inference_mode()
 def evaluate_item(model, tokenizer, item, conditions, max_new_tokens, cot):
-    from kvpress import RandomPress
-
     rows = []
     context, question_suffix = build_prompt_parts(tokenizer, item["context"])
     context_ids = tokenizer.encode(context, return_tensors="pt", add_special_tokens=False)
     n_ctx = context_ids.shape[1]
+    spans = None
 
     full_cache = None
     for cond in conditions:
         t0 = time.time()
         stats = {}
-        if cond == "nocontext":
+        base, target, control = parse_condition(cond)
+        if base == "nocontext":
             ctx, suffix = build_prompt_parts(tokenizer, "")
             ids = tokenizer.encode(ctx, return_tensors="pt", add_special_tokens=False)
             cache = prefill(model, ids)
             res = run_questions(model, tokenizer, cache, item, suffix, ids.shape[1], max_new_tokens, cot)
-        elif cond.startswith("rand"):
-            ratio = float(cond[4:])
+        elif base.startswith("rand") and target is None:
+            from kvpress import RandomPress
+
+            ratio = float(base[4:])
             torch.manual_seed(item["id"])
             cache = prefill(model, context_ids, RandomPress(compression_ratio=ratio))
             full_entries = n_ctx * model.config.num_hidden_layers * model.config.num_key_value_heads
             stats = {"kv_fraction": kv_entries(cache) / full_entries}
             res = run_questions(model, tokenizer, cache, item, question_suffix, n_ctx, max_new_tokens, cot)
-        else:
+        elif base == "full" and target is None:
             if full_cache is None:
                 full_cache = prefill(model, context_ids)
-            if cond == "full":
-                res = run_questions(model, tokenizer, full_cache, item, question_suffix, n_ctx, max_new_tokens, cot)
-            elif cond.startswith("int"):
-                bits = int(cond[3:])
-                originals = [(layer.keys, layer.values) for layer in full_cache.layers]
-                for layer in full_cache.layers:
-                    layer.keys = quantize_per_token(layer.keys, bits)
-                    layer.values = quantize_per_token(layer.values, bits)
-                head_dim = full_cache.layers[0].keys.shape[-1]
-                # Each (token, head) group also stores an fp16 scale and min.
-                stats = {"bits_per_value": bits + 32 / head_dim}
-                res = run_questions(model, tokenizer, full_cache, item, question_suffix, n_ctx, max_new_tokens, cot)
-                for layer, (k, v) in zip(full_cache.layers, originals):
-                    layer.keys, layer.values = k, v
+            res = run_questions(model, tokenizer, full_cache, item, question_suffix, n_ctx, max_new_tokens, cot)
+        elif base.startswith("rand") or parse_quant(base):
+            if full_cache is None:
+                full_cache = prefill(model, context_ids)
+            keep = []
+            if target is not None:
+                if spans is None:
+                    spans = document_token_spans(tokenizer, context, item["context"], item)
+                keep = restore_positions(spans, target, control, seed=f"{item['id']}-{target}")
+                stats["n_restored"] = len(keep)
+            originals = [(layer.keys, layer.values) for layer in full_cache.layers]
+
+            if base.startswith("rand"):
+                evict_random(full_cache, float(base[4:]), keep, seed=item["id"])
+                full_entries = n_ctx * model.config.num_hidden_layers * model.config.num_key_value_heads
+                stats["kv_fraction"] = kv_entries(full_cache) / full_entries
             else:
-                raise ValueError(f"unknown condition {cond}")
+                key_mode, value_mode, bits = parse_quant(base)
+                for layer in full_cache.layers:
+                    layer.keys = quantize_tensor(layer.keys, key_mode, bits)
+                    layer.values = quantize_tensor(layer.values, value_mode, bits)
+                if keep:
+                    keep_idx = torch.tensor(keep, device=model.device)
+                    for layer, (k, v) in zip(full_cache.layers, originals):
+                        layer.keys[:, :, keep_idx] = k[:, :, keep_idx]
+                        layer.values[:, :, keep_idx] = v[:, :, keep_idx]
+                head_dim = full_cache.layers[0].keys.shape[-1]
+                quantized = (bits_per_value(key_mode, bits, head_dim) + bits_per_value(value_mode, bits, head_dim)) / 2
+                # Restored positions are stored in fp16.
+                stats["bits_per_value"] = (quantized * (n_ctx - len(keep)) + 16 * len(keep)) / n_ctx
+
+            res = run_questions(model, tokenizer, full_cache, item, question_suffix, n_ctx, max_new_tokens, cot)
+            for layer, (k, v) in zip(full_cache.layers, originals):
+                layer.keys, layer.values = k, v
+        else:
+            raise ValueError(f"unknown condition {cond}")
         rows.append({"id": item["id"], "config": item["config"], "condition": cond, "n_ctx_tokens": n_ctx,
                      **stats, **res, "seconds": round(time.time() - t0, 2)})
     return rows
@@ -194,7 +357,14 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=16, help="use ~160 with --cot")
     parser.add_argument("--cot", action="store_true", help="let the model reason before a final 'Answer:' line")
     parser.add_argument("--out", default="results/results.jsonl")
+    parser.add_argument("--max-gpu-memory", default=None,
+                        help="e.g. 13GiB: cap the GPU memory used for weights; layers that don't fit run from CPU RAM "
+                             "(same model, slower). For GPUs too small to hold the model, such as 16 GB cards.")
     args = parser.parse_args()
+    for cond in args.conditions:  # fail on a typo before loading the model
+        base, _, _ = parse_condition(cond)
+        if not (base in ("full", "nocontext") or parse_quant(base) or re.fullmatch(r"rand[\d.]+", base)):
+            parser.error(f"unknown condition {cond}")
 
     items = [json.loads(line) for line in open(args.data)]
     if args.n_per_config is not None:
@@ -221,7 +391,15 @@ def main():
     else:
         device, dtype = "cpu", torch.float32
     tokenizer = AutoTokenizer.from_pretrained(args.model)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, attn_implementation="sdpa").to(device)
+    if args.max_gpu_memory and device == "cuda":
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, dtype=dtype, attn_implementation="sdpa",
+            device_map="auto", max_memory={0: args.max_gpu_memory, "cpu": "64GiB"})
+        offloaded = sorted({str(d) for d in model.hf_device_map.values()} - {"0", "cuda:0"})
+        print(f"device_map: {sum(str(d) not in ('0', 'cuda:0') for d in model.hf_device_map.values())} "
+              f"modules offloaded to {offloaded or 'nothing'}", flush=True)
+    else:
+        model = AutoModelForCausalLM.from_pretrained(args.model, dtype=dtype, attn_implementation="sdpa").to(device)
     model.eval()
     print(f"model={args.model} device={device} items={len(items)} conditions={args.conditions}", flush=True)
 

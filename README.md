@@ -31,11 +31,27 @@ Conditions in `eval_kv.py`:
 - `nocontext`: empty document, a sanity check that answers need the context
 - `rand<r>`: kvpress `RandomPress`, evicting a fraction `r` of KV entries (e.g. `rand0.5`)
 - `int<b>`: per-token round-to-nearest fake quantization of K and V to `b` bits (e.g. `int4`)
+- `int<b>k` / `int<b>v`: per-token quantization of K only / V only (the other stays fp16)
+- `kivi<b>`: KIVI-style quantization: K per channel (groups of 32 tokens), V per token; `kivi<b>k` quantizes K only
+  (no full-precision residual window, since the whole document is cached at once)
+
+Restoration conditions append `+<set>` to a `rand<r>`, `int*` or `kivi*` condition and keep that set of document
+positions at full fidelity (never evicted / left in fp16), on top of the compression budget:
+
+- `+fact1`, `+fact2`, `+both`: the supporting facts' tokens
+- `+after`: for each fact, the same number of tokens immediately after it
+- `+<set>_rnd`: control, the same number of random document positions (excluding both facts and `<set>`)
+
+e.g. `int4+both int4+both_rnd rand0.5+fact1 rand0.5+fact1_rnd`. `rand<r>+<set>` uses a built-in random eviction
+that mirrors `RandomPress` and reuses one random draw per item across restore sets, so comparisons are paired.
+Rows record `n_restored`, and the memory columns include the restored entries.
 
 ## Setup
 
 Python 3.10-3.12 is recommended; 3.13 also works through the `standard-pipes` shim in `requirements.txt`.
 A CUDA GPU is needed for the 7B model (~16 GB in bf16); a 24 GB card such as an RTX A5000 is enough.
+On a 16 GB card, pass e.g. `--max-gpu-memory 13GiB`: layers that don't fit run from CPU RAM, which gives identical
+outputs but is slower.
 
 ```bash
 git clone git@github.com:ZhichengZhou-1/kv-compression-multihop.git
@@ -98,6 +114,10 @@ resubmitted with the same command.
 ## Next steps
 
 1. Main sweep on 7B + CoT: random eviction (10/25/50%) and quantization (int8/4/3/2).
+   `--conditions full rand0.1 rand0.25 rand0.5 int8 int4 int3 int2`
 2. Diagnose the int4 collapse: K-only vs V-only quantization, per-channel key quantization (KIVI-style).
+   `--conditions int4 int4k int4v kivi4 kivi4k kivi3 kivi2`
 3. Restoration: restore KV entries for fact 1, fact 2, both, and positions after the facts,
    against random restorations of the same size.
+   `--conditions rand0.5+fact1 rand0.5+fact1_rnd rand0.5+fact2 rand0.5+fact2_rnd rand0.5+both rand0.5+both_rnd rand0.5+after rand0.5+after_rnd`
+   (likewise with a quantization base that loses accuracy, e.g. `int3+...` or `kivi2+...`)

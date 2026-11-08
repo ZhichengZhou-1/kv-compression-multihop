@@ -11,25 +11,40 @@ For each condition (and optionally each config field) reports:
 Usage:
     python summarize.py results/baseline.jsonl
     python summarize.py results/*.jsonl --by n_distractors
+
+Restoration conditions (<base>+<set>) are listed right after their base, each followed by its _rnd control.
 """
 
 import argparse
 import collections
 import json
+import re
 
 KEYS = ("hop1", "hop2", "two_hop")
+RESTORE_ORDER = ("fact1", "fact2", "both", "after")
 
 
 def condition_order(cond):
-    if cond == "full":
-        return (0, 0)
-    if cond == "nocontext":
-        return (3, 0)
-    if cond.startswith("rand"):
-        return (1, float(cond[4:]))
-    if cond.startswith("int"):
-        return (2, -int(cond[3:]))
-    return (4, 0)
+    """full, then rand by ratio, then quantization by bits (int before kivi, both K/V before K-only before
+    V-only), then nocontext; restoration variants sort right after their base, each target before its control."""
+    base, _, restore = cond.partition("+")
+    if restore:
+        target = restore.removesuffix("_rnd")
+        rank = RESTORE_ORDER.index(target) if target in RESTORE_ORDER else len(RESTORE_ORDER)
+        restore_key = (1, rank, restore.endswith("_rnd"))
+    else:
+        restore_key = (0, 0, False)
+    if base == "full":
+        base_key = (0, 0, 0, 0)
+    elif base == "nocontext":
+        base_key = (3, 0, 0, 0)
+    elif base.startswith("rand"):
+        base_key = (1, float(base[4:]), 0, 0)
+    elif m := re.fullmatch(r"(int|kivi)(\d+)([kv]?)", base):
+        base_key = (2, -int(m.group(2)), m.group(1) == "kivi", {"": 0, "k": 1, "v": 2}[m.group(3)])
+    else:
+        base_key = (4, 0, 0, 0)
+    return base_key + restore_key + (cond,)
 
 
 def memory_fraction(row):
@@ -68,13 +83,13 @@ def main():
         sub = json.dumps(r["config"][args.by]) if args.by else ""
         groups[(r["condition"], sub)].append(r)
 
-    header = f"{'condition':<10} {args.by or '':>14} {'n':>5} {'mem':>5} {'hop1':>6} {'hop2':>6} {'2hop':>6} " \
+    header = f"{'condition':<18} {args.by or '':>14} {'n':>5} {'mem':>5} {'hop1':>6} {'hop2':>6} {'2hop':>6} " \
              f"{'indep':>6} {'both1':>6} {'cfail':>6} {'lp_h1':>7} {'lp_h2':>7} {'lp_2h':>7}"
     print(header)
     print("-" * len(header))
     for (cond, sub) in sorted(groups, key=lambda g: (condition_order(g[0]), g[1])):
         s = summarize(groups[(cond, sub)])
-        print(f"{cond:<10} {sub:>14} {s['n']:>5} {s['memory']:>5.2f} {s['acc_hop1']:>6.3f} {s['acc_hop2']:>6.3f} "
+        print(f"{cond:<18} {sub:>14} {s['n']:>5} {s['memory']:>5.2f} {s['acc_hop1']:>6.3f} {s['acc_hop2']:>6.3f} "
               f"{s['acc_two_hop']:>6.3f} {s['indep']:>6.3f} {s['both_single']:>6.3f} {s['comp_fail']:>6.3f} "
               f"{s['lp_hop1']:>7.2f} {s['lp_hop2']:>7.2f} {s['lp_two_hop']:>7.2f}")
 

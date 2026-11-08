@@ -21,7 +21,7 @@ import json
 import re
 
 KEYS = ("hop1", "hop2", "two_hop")
-RESTORE_ORDER = ("fact1", "fact2", "both", "after")
+RESTORE_ORDER = ("fact1", "fact2", "both", "after", "bothafter")
 
 
 def condition_order(cond):
@@ -83,13 +83,13 @@ def main():
         sub = json.dumps(r["config"][args.by]) if args.by else ""
         groups[(r["condition"], sub)].append(r)
 
-    header = f"{'condition':<18} {args.by or '':>14} {'n':>5} {'mem':>5} {'hop1':>6} {'hop2':>6} {'2hop':>6} " \
+    header = f"{'condition':<22} {args.by or '':>14} {'n':>5} {'mem':>5} {'hop1':>6} {'hop2':>6} {'2hop':>6} " \
              f"{'indep':>6} {'both1':>6} {'cfail':>6} {'lp_h1':>7} {'lp_h2':>7} {'lp_2h':>7}"
     print(header)
     print("-" * len(header))
     for (cond, sub) in sorted(groups, key=lambda g: (condition_order(g[0]), g[1])):
         s = summarize(groups[(cond, sub)])
-        print(f"{cond:<18} {sub:>14} {s['n']:>5} {s['memory']:>5.2f} {s['acc_hop1']:>6.3f} {s['acc_hop2']:>6.3f} "
+        print(f"{cond:<22} {sub:>14} {s['n']:>5} {s['memory']:>5.2f} {s['acc_hop1']:>6.3f} {s['acc_hop2']:>6.3f} "
               f"{s['acc_two_hop']:>6.3f} {s['indep']:>6.3f} {s['both_single']:>6.3f} {s['comp_fail']:>6.3f} "
               f"{s['lp_hop1']:>7.2f} {s['lp_hop2']:>7.2f} {s['lp_two_hop']:>7.2f}")
 

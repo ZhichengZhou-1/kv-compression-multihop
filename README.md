@@ -40,7 +40,9 @@ positions at full fidelity (never evicted / left in fp16), on top of the compres
 
 - `+fact1`, `+fact2`, `+both`: the supporting facts' tokens
 - `+after`: for each fact, the same number of tokens immediately after it
-- `+<set>_rnd`: control, the same number of random document positions (excluding both facts and `<set>`)
+- `+bothafter`: both facts plus the `after` tokens
+- `+<set>_rnd`: control, the same number of random document positions (excluding both facts and `<set>`);
+  for `bothafter` the facts stay restored and only the `after` part is replaced by random positions
 
 e.g. `int4+both int4+both_rnd rand0.5+fact1 rand0.5+fact1_rnd`. `rand<r>+<set>` uses a built-in random eviction
 that mirrors `RandomPress` and reuses one random draw per item across restore sets, so comparisons are paired.
@@ -121,3 +123,6 @@ resubmitted with the same command.
    against random restorations of the same size.
    `--conditions rand0.5+fact1 rand0.5+fact1_rnd rand0.5+fact2 rand0.5+fact2_rnd rand0.5+both rand0.5+both_rnd rand0.5+after rand0.5+after_rnd`
    (likewise with a quantization base that loses accuracy, e.g. `int3+...` or `kivi2+...`)
+4. Does combining need the tokens after the facts? Restore both facts plus the following tokens, against both facts
+   plus random positions of the same size.
+   `--conditions rand0.5+both rand0.5+bothafter rand0.5+bothafter_rnd`

@@ -18,7 +18,9 @@ Restoration (appended to a rand<r>, int*/kivi* condition with '+'):
     <base>+fact2       same for fact 2
     <base>+both        both facts
     <base>+after       for each fact, the same number of tokens right after it
-    <base>+<set>_rnd   control: the same number of random document positions, excluding the facts and <set>
+    <base>+bothafter   both facts plus the 'after' tokens
+    <base>+<set>_rnd   control: the same number of random document positions, excluding the facts and <set>;
+                       for bothafter the facts stay restored and only the 'after' part is replaced by random positions
     Restored entries are kept on top of the compression budget. rand<r>+<set> uses a built-in random eviction
     that mirrors RandomPress and shares its random draw across all restore sets of an item.
 
@@ -69,7 +71,7 @@ def build_prompt_parts(tokenizer, document):
 
 KIVI_GROUP_SIZE = 32  # tokens per (scale, min) group for per-channel key quantization
 QUANT_RE = re.compile(r"^(int|kivi)(\d+)([kv]?)$")
-RESTORE_SETS = ("fact1", "fact2", "both", "after")
+RESTORE_SETS = ("fact1", "fact2", "both", "after", "bothafter")
 
 
 def _fake_quantize(x, bits, dim):
@@ -142,8 +144,10 @@ def restore_positions(spans, target, control, seed):
 
     fact1 / fact2 / both: the supporting facts' tokens.
     after: for each fact, the same number of tokens immediately after it (excluding the facts themselves).
+    bothafter: both facts plus the after tokens.
     control: the same number of positions drawn uniformly from the rest of the document, excluding both facts
-             and the target set.
+             and the target set. For bothafter the facts are kept and only the after part is randomized, so
+             bothafter vs bothafter_rnd isolates the after tokens given that the facts are present.
     """
     facts = set(spans["fact1"]) | set(spans["fact2"])
     doc_end = spans["doc"][-1] + 1
@@ -153,12 +157,17 @@ def restore_positions(spans, target, control, seed):
         chosen = set(spans["fact2"])
     elif target == "both":
         chosen = facts
-    elif target == "after":
+    elif target in ("after", "bothafter"):
         chosen = set()
         for key in ("fact1", "fact2"):
             last, size = spans[key][-1], len(spans[key])
             chosen |= set(range(last + 1, min(last + 1 + size, doc_end)))
         chosen -= facts
+        if target == "bothafter":
+            if not control:
+                return sorted(chosen | facts)
+            pool = sorted(set(spans["doc"]) - facts - chosen)
+            return sorted(facts | set(random.Random(seed).sample(pool, len(chosen))))
     else:
         raise ValueError(f"unknown restore set {target}")
     if not control:

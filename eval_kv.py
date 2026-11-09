@@ -19,6 +19,7 @@ Restoration (appended to a rand<r>, int*/kivi* condition with '+'):
     <base>+both        both facts
     <base>+after       for each fact, the same number of tokens right after it
     <base>+bothafter   both facts plus the 'after' tokens
+    <base>+all         every context position (sanity check: should reproduce 'full' exactly; no _rnd control)
     <base>+<set>_rnd   control: the same number of random document positions, excluding the facts and <set>;
                        for bothafter the facts stay restored and only the 'after' part is replaced by random positions
     Restored entries are kept on top of the compression budget. rand<r>+<set> uses a built-in random eviction
@@ -71,7 +72,7 @@ def build_prompt_parts(tokenizer, document):
 
 KIVI_GROUP_SIZE = 32  # tokens per (scale, min) group for per-channel key quantization
 QUANT_RE = re.compile(r"^(int|kivi)(\d+)([kv]?)$")
-RESTORE_SETS = ("fact1", "fact2", "both", "after", "bothafter")
+RESTORE_SETS = ("fact1", "fact2", "both", "after", "bothafter", "all")
 
 
 def _fake_quantize(x, bits, dim):
@@ -192,7 +193,7 @@ def evict_random(cache, ratio, keep, seed):
         n_heads = layer.keys.shape[1]
         scores = torch.rand(n_heads, n, generator=gen)
         scores[:, keep] = 2.0  # above every random score, so always kept
-        idx = scores.topk(n_kept + len(keep), dim=-1).indices.sort(dim=-1).values
+        idx = scores.topk(min(n, n_kept + len(keep)), dim=-1).indices.sort(dim=-1).values
         idx = idx.to(layer.keys.device)[None, :, :, None]
         layer.keys = layer.keys.gather(2, idx.expand(-1, -1, -1, layer.keys.shape[-1]))
         layer.values = layer.values.gather(2, idx.expand(-1, -1, -1, layer.values.shape[-1]))
@@ -281,6 +282,8 @@ def parse_condition(cond):
     target = restore[:-len("_rnd")] if control else restore
     if target not in RESTORE_SETS:
         raise ValueError(f"unknown restore set in {cond}; expected one of {RESTORE_SETS} (optionally + '_rnd')")
+    if target == "all" and control:
+        raise ValueError(f"{cond}: the 'all' restore set has no random control")
     if not (base.startswith("rand") or parse_quant(base)):
         raise ValueError(f"restoration needs a rand<r>, int<b> or kivi<b> base, got {cond}")
     return base, target, control
@@ -321,7 +324,10 @@ def evaluate_item(model, tokenizer, item, conditions, max_new_tokens, cot):
             if full_cache is None:
                 full_cache = prefill(model, context_ids)
             keep = []
-            if target is not None:
+            if target == "all":
+                keep = list(range(n_ctx))
+                stats["n_restored"] = n_ctx
+            elif target is not None:
                 if spans is None:
                     spans = document_token_spans(tokenizer, context, item["context"], item)
                 keep = restore_positions(spans, target, control, seed=f"{item['id']}-{target}")

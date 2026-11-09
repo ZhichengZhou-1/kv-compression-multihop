@@ -41,6 +41,7 @@ positions at full fidelity (never evicted / left in fp16), on top of the compres
 - `+fact1`, `+fact2`, `+both`: the supporting facts' tokens
 - `+after`: for each fact, the same number of tokens immediately after it
 - `+bothafter`: both facts plus the `after` tokens
+- `+all`: every context position, a sanity check that should reproduce `full` exactly (no `_rnd` control)
 - `+<set>_rnd`: control, the same number of random document positions (excluding both facts and `<set>`);
   for `bothafter` the facts stay restored and only the `after` part is replaced by random positions
 

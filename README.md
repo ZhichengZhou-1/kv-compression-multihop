@@ -105,6 +105,8 @@ resubmitted with the same command.
 
 | Setup | hop1 | hop2 | two-hop | expected if independent |
 |---|---|---|---|---|
+| Qwen2.5-0.5B, direct answer | 0.53 | 0.67 | 0.02 | 0.36 |
+| Qwen2.5-0.5B, CoT | 0.38 | 0.44 | 0.05 | 0.16 |
 | Qwen2.5-1.5B, direct answer | 0.52 | 0.63 | 0.05 | 0.32 |
 | Qwen2.5-1.5B, CoT | 0.27 | 0.33 | 0.19 | 0.09 |
 | Qwen2.5-7B, direct answer | 0.84 | 0.92 | 0.16 | 0.78 |

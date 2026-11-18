@@ -12,7 +12,7 @@
 # Submit from the repo root (logs/ must exist there).
 # Usage: sbatch run_eval.sbatch <out.jsonl> <n_per_config> <condition> [condition ...]
 # e.g.   sbatch run_eval.sbatch results/baseline.jsonl 25 full nocontext
-# Extra eval_kv.py flags go in EXTRA_ARGS, e.g.
+# Set DATA to use another data file. Extra eval_kv.py flags go in EXTRA_ARGS, e.g.
 #        sbatch --export=ALL,EXTRA_ARGS="--model Qwen/Qwen2.5-7B-Instruct --cot --max-new-tokens 160" run_eval.sbatch ...
 
 set -euo pipefail
@@ -24,4 +24,4 @@ N=$2
 shift 2
 
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv
-.venv/bin/python eval_kv.py --data data/two_hop.jsonl --out "$OUT" --n-per-config "$N" ${EXTRA_ARGS:-} --conditions "$@"
+.venv/bin/python eval_kv.py --data "${DATA:-data/two_hop.jsonl}" --out "$OUT" --n-per-config "$N" ${EXTRA_ARGS:-} --conditions "$@"

@@ -21,11 +21,13 @@ import json
 import re
 
 KEYS = ("hop1", "hop2", "two_hop")
-RESTORE_ORDER = ("fact1", "fact2", "both", "after", "bothafter")
+RESTORE_ORDER = ("none", "prefix", "fact1", "fact2", "both", "after", "afterearly", "afterlate", "bothafter",
+                 "bothearly", "bothlate", "all")
+PRESS_ORDER = ("snap", "stream", "h2o", "expatt")
 
 
 def condition_order(cond):
-    """full, then rand by ratio, then quantization by bits (int before kivi, both K/V before K-only before
+    """full, then rand by ratio, then scored presses, then quantization by bits (int before kivi, both K/V before K-only before
     V-only), then nocontext; restoration variants sort right after their base, each target before its control."""
     base, _, restore = cond.partition("+")
     if restore:
@@ -40,6 +42,8 @@ def condition_order(cond):
         base_key = (3, 0, 0, 0)
     elif base.startswith("rand"):
         base_key = (1, float(base[4:]), 0, 0)
+    elif m := re.fullmatch(r"(snap|stream|h2o|expatt)([\d.]+)", base):
+        base_key = (1.5, PRESS_ORDER.index(m.group(1)), float(m.group(2)), 0)
     elif m := re.fullmatch(r"(int|kivi)(\d+)([kv]?)", base):
         base_key = (2, -int(m.group(2)), m.group(1) == "kivi", {"": 0, "k": 1, "v": 2}[m.group(3)])
     else:
